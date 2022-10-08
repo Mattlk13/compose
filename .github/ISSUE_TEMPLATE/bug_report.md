@@ -8,6 +8,16 @@ assignees: ''
 ---
 
 <!--
+**DEPRECATION NOTICE:**
+
+Compose V1 is end-of-life, and as such only issues relating to security vulnerabilities will be considered.
+
+Please do not submit issues regarding bugs or improvements.
+
+For a more up-to-date compose, check v2: https://github.com/docker/compose/tree/v2/
+-->
+
+<!--
 Welcome to the docker-compose issue tracker! Before creating an issue, please heed the following:
 
 1. This tracker should only be used to report bugs and request features / enhancements to docker-compose
@@ -25,7 +35,10 @@ Welcome to the docker-compose issue tracker! Before creating an issue, please he
 
 ## Context information (for bug reports)
 
-**Output of `docker-compose version`**
+- [ ] Using Compose V2 `docker compose ...`
+- [ ] Using Compose V1 `docker-compose ...`
+
+**Output of `docker(-)compose version`**
 ```
 (paste here)
 ```

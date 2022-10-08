@@ -10,7 +10,11 @@ from operator import attrgetter
 from operator import itemgetter
 
 import yaml
-from cached_property import cached_property
+
+try:
+    from functools import cached_property
+except ImportError:
+    from cached_property import cached_property
 
 from . import types
 from ..const import COMPOSE_SPEC as VERSION
@@ -20,6 +24,7 @@ from ..utils import json_hash
 from ..utils import parse_bytes
 from ..utils import parse_nanoseconds_int
 from ..utils import splitdrive
+from ..version import ComposeVersion
 from .environment import env_vars_from_file
 from .environment import Environment
 from .environment import split_env
@@ -132,6 +137,7 @@ ALLOWED_KEYS = DOCKER_CONFIG_KEYS + [
     'logging',
     'network_mode',
     'platform',
+    'profiles',
     'scale',
     'stop_grace_period',
 ]
@@ -147,9 +153,14 @@ DOCKER_VALID_URL_PREFIXES = (
 SUPPORTED_FILENAMES = [
     'docker-compose.yml',
     'docker-compose.yaml',
+    'compose.yml',
+    'compose.yaml',
 ]
 
-DEFAULT_OVERRIDE_FILENAMES = ('docker-compose.override.yml', 'docker-compose.override.yaml')
+DEFAULT_OVERRIDE_FILENAMES = ('docker-compose.override.yml',
+                              'docker-compose.override.yaml',
+                              'compose.override.yml',
+                              'compose.override.yaml')
 
 
 log = logging.getLogger(__name__)
@@ -183,6 +194,13 @@ class ConfigFile(namedtuple('_ConfigFile', 'filename config')):
     @classmethod
     def from_filename(cls, filename):
         return cls(filename, load_yaml(filename))
+
+    @cached_property
+    def config_version(self):
+        version = self.config.get('version', None)
+        if isinstance(version, dict):
+            return V1
+        return ComposeVersion(version) if version else self.version
 
     @cached_property
     def version(self):
@@ -222,15 +240,13 @@ class ConfigFile(namedtuple('_ConfigFile', 'filename config')):
                     'Version "{}" in "{}" is invalid.'
                     .format(version, self.filename))
 
-            if version.startswith("1"):
-                version = V1
-
-        if version == V1:
+        if version.startswith("1"):
             raise ConfigurationError(
                 'Version in "{}" is invalid. {}'
                 .format(self.filename, VERSION_EXPLANATION)
             )
-        return version
+
+        return VERSION
 
     def get_service(self, name):
         return self.get_service_dicts()[name]
@@ -253,8 +269,10 @@ class ConfigFile(namedtuple('_ConfigFile', 'filename config')):
         return {} if self.version == V1 else self.config.get('configs', {})
 
 
-class Config(namedtuple('_Config', 'version services volumes networks secrets configs')):
+class Config(namedtuple('_Config', 'config_version version services volumes networks secrets configs')):
     """
+    :param config_version: configuration file version
+    :type  config_version: int
     :param version: configuration version
     :type  version: int
     :param services: List of service description dictionaries
@@ -295,7 +313,16 @@ def find(base_dir, filenames, environment, override_dir=None):
     if filenames:
         filenames = [os.path.join(base_dir, f) for f in filenames]
     else:
+        # search for compose files in the base dir and its parents
         filenames = get_default_config_files(base_dir)
+        if not filenames and not override_dir:
+            # none found in base_dir and no override_dir defined
+            raise ComposeFileNotFound(SUPPORTED_FILENAMES)
+        if not filenames:
+            # search for compose files in the project directory and its parents
+            filenames = get_default_config_files(override_dir)
+            if not filenames:
+                raise ComposeFileNotFound(SUPPORTED_FILENAMES)
 
     log.debug("Using configuration files: {}".format(",".join(filenames)))
     return ConfigDetails(
@@ -326,7 +353,7 @@ def get_default_config_files(base_dir):
     (candidates, path) = find_candidates_in_parent_dirs(SUPPORTED_FILENAMES, base_dir)
 
     if not candidates:
-        raise ComposeFileNotFound(SUPPORTED_FILENAMES)
+        return None
 
     winner = candidates[0]
 
@@ -365,6 +392,23 @@ def find_candidates_in_parent_dirs(filenames, path):
     return (candidates, path)
 
 
+def check_swarm_only_config(service_dicts):
+    warning_template = (
+        "Some services ({services}) use the '{key}' key, which will be ignored. "
+        "Compose does not support '{key}' configuration - use "
+        "`docker stack deploy` to deploy to a swarm."
+    )
+    key = 'configs'
+    services = [s for s in service_dicts if s.get(key)]
+    if services:
+        log.warning(
+            warning_template.format(
+                services=", ".join(sorted(s['name'] for s in services)),
+                key=key
+            )
+        )
+
+
 def load(config_details, interpolate=True):
     """Load the configuration from a working directory and a list of
     configuration files.  Files are loaded in order, and merged on top
@@ -401,9 +445,10 @@ def load(config_details, interpolate=True):
         for service_dict in service_dicts:
             match_named_volumes(service_dict, volumes)
 
-    version = main_file.version
+    check_swarm_only_config(service_dicts)
 
-    return Config(version, service_dicts, volumes, networks, secrets, configs)
+    return Config(main_file.config_version, main_file.version,
+                  service_dicts, volumes, networks, secrets, configs)
 
 
 def load_mapping(config_files, get_func, entity_type, working_dir=None):
@@ -450,9 +495,6 @@ def format_device_option(entity_type, config):
     device = config['driver_opts'].get('device')
     if o and o == 'bind' and device:
         fullpath = os.path.abspath(os.path.expanduser(device))
-        if not os.path.exists(fullpath):
-            raise ConfigurationError(
-                "Device path {} does not exist.".format(fullpath))
         return fullpath
 
 
@@ -532,8 +574,7 @@ def process_config_section(config_file, config, section, environment, interpolat
             config_file.version,
             config,
             section,
-            environment
-            )
+            environment)
     else:
         return config
 
@@ -1043,7 +1084,7 @@ def merge_service_dicts(base, override, version):
 
     for field in [
         'cap_add', 'cap_drop', 'expose', 'external_links',
-        'volumes_from', 'device_cgroup_rules',
+        'volumes_from', 'device_cgroup_rules', 'profiles',
     ]:
         md.merge_field(field, merge_unique_items_lists, default=[])
 
@@ -1162,6 +1203,7 @@ def merge_reservations(base, override):
     md.merge_scalar('cpus')
     md.merge_scalar('memory')
     md.merge_sequence('generic_resources', types.GenericResource.parse)
+    md.merge_field('devices', merge_unique_objects_lists, default=[])
     return dict(md)
 
 

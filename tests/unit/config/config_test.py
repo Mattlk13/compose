@@ -168,12 +168,14 @@ class ConfigTest(unittest.TestCase):
                 }
             })
         )
+        assert cfg.config_version == VERSION
         assert cfg.version == VERSION
 
         for version in ['2', '2.0', '2.1', '2.2', '2.3',
                         '3', '3.0', '3.1', '3.2', '3.3', '3.4', '3.5', '3.6', '3.7', '3.8']:
             cfg = config.load(build_config_details({'version': version}))
-            assert cfg.version == version
+            assert cfg.config_version == version
+            assert cfg.version == VERSION
 
     def test_v1_file_version(self):
         cfg = config.load(build_config_details({'web': {'image': 'busybox'}}))
@@ -236,7 +238,9 @@ class ConfigTest(unittest.TestCase):
                 )
             )
 
-        assert 'Invalid top-level property "web"' in excinfo.exconly()
+        assert "compose.config.errors.ConfigurationError: " \
+               "The Compose file 'filename.yml' is invalid because:\n" \
+               "'web' does not match any of the regexes: '^x-'" in excinfo.exconly()
         assert VERSION_EXPLANATION in excinfo.exconly()
 
     def test_named_volume_config_empty(self):
@@ -665,7 +669,7 @@ class ConfigTest(unittest.TestCase):
 
             assert 'Invalid service name \'mong\\o\'' in excinfo.exconly()
 
-    def test_config_duplicate_cache_from_values_validation_error(self):
+    def test_config_duplicate_cache_from_values_no_validation_error(self):
         with pytest.raises(ConfigurationError) as exc:
             config.load(
                 build_config_details({
@@ -677,7 +681,7 @@ class ConfigTest(unittest.TestCase):
                 })
             )
 
-        assert 'build.cache_from contains non-unique items' in exc.exconly()
+        assert 'build.cache_from contains non-unique items' not in exc.exconly()
 
     def test_load_with_multiple_files_v1(self):
         base_file = config.ConfigFile(
@@ -2393,7 +2397,8 @@ web:
             'image': 'busybox',
             'depends_on': {
                 'app1': {'condition': 'service_started'},
-                'app2': {'condition': 'service_healthy'}
+                'app2': {'condition': 'service_healthy'},
+                'app3': {'condition': 'service_completed_successfully'}
             }
         }
         override = {}
@@ -2405,11 +2410,12 @@ web:
             'image': 'busybox',
             'depends_on': {
                 'app1': {'condition': 'service_started'},
-                'app2': {'condition': 'service_healthy'}
+                'app2': {'condition': 'service_healthy'},
+                'app3': {'condition': 'service_completed_successfully'}
             }
         }
         override = {
-            'depends_on': ['app3']
+            'depends_on': ['app4']
         }
 
         actual = config.merge_service_dicts(base, override, VERSION)
@@ -2418,7 +2424,8 @@ web:
             'depends_on': {
                 'app1': {'condition': 'service_started'},
                 'app2': {'condition': 'service_healthy'},
-                'app3': {'condition': 'service_started'}
+                'app3': {'condition': 'service_completed_successfully'},
+                'app4': {'condition': 'service_started'},
             }
         }
 
@@ -3563,9 +3570,11 @@ class InterpolationTest(unittest.TestCase):
     @mock.patch.dict(os.environ)
     def test_config_file_with_options_environment_file(self):
         project_dir = 'tests/fixtures/default-env-file'
+        # env-file is relative to current working dir
+        env = Environment.from_env_file(project_dir, project_dir + '/.env2')
         service_dicts = config.load(
             config.find(
-                project_dir, None, Environment.from_env_file(project_dir, '.env2')
+                project_dir, None, env
             )
         ).services
 
@@ -5229,6 +5238,8 @@ class GetDefaultConfigFilesTestCase(unittest.TestCase):
     files = [
         'docker-compose.yml',
         'docker-compose.yaml',
+        'compose.yml',
+        'compose.yaml',
     ]
 
     def test_get_config_path_default_file_in_basedir(self):
@@ -5262,8 +5273,10 @@ def get_config_filename_for_files(filenames, subdir=None):
             base_dir = tempfile.mkdtemp(dir=project_dir)
         else:
             base_dir = project_dir
-        filename, = config.get_default_config_files(base_dir)
-        return os.path.basename(filename)
+        filenames = config.get_default_config_files(base_dir)
+        if not filenames:
+            raise config.ComposeFileNotFound(config.SUPPORTED_FILENAMES)
+        return os.path.basename(filenames[0])
     finally:
         shutil.rmtree(project_dir)
 
@@ -5369,7 +5382,7 @@ class SerializeTest(unittest.TestCase):
         assert serialized_config['secrets']['two'] == {'external': True, 'name': 'two'}
 
     def test_serialize_ports(self):
-        config_dict = config.Config(version=VERSION, services=[
+        config_dict = config.Config(config_version=VERSION, version=VERSION, services=[
             {
                 'ports': [types.ServicePort('80', '8080', None, None, None)],
                 'image': 'alpine',
@@ -5380,8 +5393,20 @@ class SerializeTest(unittest.TestCase):
         serialized_config = yaml.safe_load(serialize_config(config_dict))
         assert [{'published': 8080, 'target': 80}] == serialized_config['services']['web']['ports']
 
+    def test_serialize_ports_v1(self):
+        config_dict = config.Config(config_version=V1, version=V1, services=[
+            {
+                'ports': [types.ServicePort('80', '8080', None, None, None)],
+                'image': 'alpine',
+                'name': 'web'
+            }
+        ], volumes={}, networks={}, secrets={}, configs={})
+
+        serialized_config = yaml.safe_load(serialize_config(config_dict))
+        assert ['8080:80/tcp'] == serialized_config['services']['web']['ports']
+
     def test_serialize_ports_with_ext_ip(self):
-        config_dict = config.Config(version=VERSION, services=[
+        config_dict = config.Config(config_version=VERSION, version=VERSION, services=[
             {
                 'ports': [types.ServicePort('80', '8080', None, None, '127.0.0.1')],
                 'image': 'alpine',
